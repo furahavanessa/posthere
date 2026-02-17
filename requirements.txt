@@ -4,3 +4,4 @@ python-dotenv==1.0.*
 deep-translator==1.11.*
 psycopg2-binary==2.9.*
 gunicorn==23.0.*
+groq==0.*
