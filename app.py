@@ -1,4 +1,4 @@
-# app.py
+# app.py — PostHere: Groq + Supabase saving version (English)
 
 import os
 import json
@@ -16,9 +16,8 @@ load_dotenv()
 app = Flask(__name__)
 
 # ───────────────────────────────────────────────
-#  Credentials
+# Credentials
 # ───────────────────────────────────────────────
-
 TWILIO_SID    = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
@@ -32,9 +31,8 @@ groq_client   = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 conversation_history = {}
 
 # ───────────────────────────────────────────────
-#  System prompt – instructs Groq to output JSON when report is complete
+# System prompt – instructs Groq to output JSON when report is complete
 # ───────────────────────────────────────────────
-
 SYSTEM_PROMPT = """
 You are PostHere — the official, trustworthy Lost & Found assistant for Goma (DRC).
 
