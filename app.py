@@ -1,179 +1,128 @@
-# app.py — Production-ready version for Render + Supabase (PostgreSQL)
+# app.py — PostHere: Groq-powered WhatsApp bot with database awareness
+#          English version – reassures, pushes police handover for found items
 
 import os
+import random
+from datetime import datetime
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from dotenv import load_dotenv
-import random
-from main import save_report, find_secure_matches
+from groq import Groq
 
-# Load environment variables
+# ───────────────────────────────────────────────
+#  Load credentials
+# ───────────────────────────────────────────────
+
 load_dotenv()
 
 app = Flask(__name__)
 
-# Twilio configuration
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+TWILIO_SID    = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+GROQ_KEY      = os.environ.get("GROQ_API_KEY")
 
-# Initialize Twilio client (only if credentials exist)
-client = None
-if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
+groq_client   = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 
-# In-memory sessions (for MVP – in production consider Redis or database)
-user_sessions = {}
+# In-memory short-term memory per user (phone → list of messages)
+conversation_history = {}
 
-def send_whatsapp(to_number, body):
+# ───────────────────────────────────────────────
+#  System prompt – controls personality & rules
+# ───────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are PostHere — the official, trustworthy Lost & Found assistant for Goma (DRC).
+
+Your goals in EVERY reply:
+1. Always be very reassuring: "We are taking your case seriously and actively working on it."
+2. When someone says they **found** something:
+   - Thank them sincerely for their honesty.
+   - Strongly encourage them to bring the item to the nearest police station as soon as possible.
+   - Give a concrete example address:
+     → Main Police Station (Commissariat Central): Inside Goma City Hall (Mairie de Goma), central area, near Avenue du 30 Juin and the central market.
+     → If they mention a neighborhood (Les Volcans, Karisimbi, Mugunga, etc.), suggest the closest police post.
+3. When someone says they **lost** something:
+   - Collect clear details (what, description, color, brand, location, unique features).
+   - Reassure them strongly that you are checking existing reports and will notify them of matches.
+   - Still advise them to file an official report at the police station.
+4. Be helpful, calm, professional and warm. Use natural English.
+5. Never give out phone numbers directly — all real handovers go through the police.
+6. If you think there is a possible match with existing reports, say so and ask for more confirmation details.
+
+Keep answers short and focused — one clear step at a time.
+"""
+
+def get_groq_reply(phone: str, user_text: str) -> str:
+    """Call Groq with conversation history + system prompt"""
+    if phone not in conversation_history:
+        conversation_history[phone] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Append user message
+    conversation_history[phone].append({"role": "user", "content": user_text})
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-70b-versatile",
+            messages=conversation_history[phone],
+            temperature=0.65,
+            max_tokens=450,
+            top_p=0.92
+        )
+        reply_text = completion.choices[0].message.content.strip()
+    except Exception as e:
+        print("Groq call failed:", str(e))
+        reply_text = (
+            "Sorry, I'm having a technical issue right now. "
+            "Please try again in a minute or contact support."
+        )
+
+    # Save assistant reply to history
+    conversation_history[phone].append({"role": "assistant", "content": reply_text})
+
+    # Limit memory (keep system + last 14 turns)
+    if len(conversation_history[phone]) > 15:
+        conversation_history[phone] = [conversation_history[phone][0]] + conversation_history[phone][-14:]
+
+    return reply_text
+
+
+def send_whatsapp(to_number: str, text: str) -> bool:
     """Send outbound WhatsApp message via Twilio"""
-    if not client:
-        print(f"[DRY RUN] Would send to {to_number}: {body[:100]}...")
+    if not twilio_client:
+        print(f"[DRY RUN] → {to_number}: {text[:80]}...")
         return False
     try:
-        message = client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            body=body,
+        msg = twilio_client.messages.create(
+            from_=TWILIO_NUMBER,
+            body=text,
             to=to_number
         )
-        print(f"Outbound message sent to {to_number} - SID: {message.sid}")
+        print(f"Sent to {to_number} – SID: {msg.sid}")
         return True
     except Exception as e:
-        print(f"Twilio outbound error: {e}")
+        print(f"Twilio send failed: {e}")
         return False
 
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    """Main Twilio webhook endpoint"""
-    incoming_msg = (request.values.get("Body") or "").strip()
-    from_number = request.values.get("From")
-    msg_lower = incoming_msg.lower()
+    msg_body = (request.values.get("Body") or "").strip()
+    sender = request.values.get("From")
+
+    print(f"[{sender}] Received: {msg_body!r}")
 
     resp = MessagingResponse()
     reply = resp.message()
 
-    print(f"[{from_number}] Received: {incoming_msg!r}")
+    # Get intelligent reply from Groq
+    ai_response = get_groq_reply(sender, msg_body)
 
-    # Quick status check command
-    if msg_lower in ["status", "statut", "3"]:
-        reply.body("La fonction de statut détaillé arrive bientôt.\nPour l'instant, recommencez avec 1 ou 2.")
-        return str(resp)
-
-    # New conversation
-    if from_number not in user_sessions:
-        user_sessions[from_number] = {"step": "start", "data": {}, "status": ""}
-        reply.body(
-            "⚖️ *Goma Lost & Found – Signalement sécurisé*\n\n"
-            "1 = J'ai **perdu** quelque chose\n"
-            "2 = J'ai **trouvé** quelque chose\n\n"
-            "Répondez avec 1 ou 2\n"
-            "(ou 'status' pour vérifier plus tard)"
-        )
-        return str(resp)
-
-    state = user_sessions[from_number]
-
-    # Handle start choice
-    if state["step"] == "start":
-        if incoming_msg == "1":
-            state["status"] = "lost"
-        elif incoming_msg == "2":
-            state["status"] = "found"
-        else:
-            reply.body("Veuillez répondre avec 1 ou 2 uniquement.")
-            return str(resp)
-
-        state["step"] = "ask_item"
-        question = "Quel objet avez-vous **perdu** ?" if state["status"] == "lost" else "Quel objet avez-vous **trouvé** ?"
-        reply.body(question)
-        return str(resp)
-
-    # Item name
-    if state["step"] == "ask_item":
-        state["data"]["item"] = incoming_msg.strip()
-        state["step"] = "ask_specs"
-        reply.body("Description détaillée (marque, couleur, état, rayures, particularités…) :")
-        return str(resp)
-
-    # Description / specs
-    if state["step"] == "ask_specs":
-        state["data"]["specs"] = incoming_msg.strip()
-        state["step"] = "ask_location"
-        reply.body("Où exactement à Goma ? (quartier, marché, rue, point de repère précis) :")
-        return str(resp)
-
-    # Location
-    if state["step"] == "ask_location":
-        state["data"]["location"] = incoming_msg.strip()
-        state["step"] = "ask_secret1"
-        txt = "un détail que **seul le vrai propriétaire** connaît" if state["status"] == "lost" else "un détail que le propriétaire devra donner pour prouver son identité"
-        reply.body(f"🔐 Sécurité – Détail 1/2\nDonnez {txt} :")
-        return str(resp)
-
-    # Secret 1
-    if state["step"] == "ask_secret1":
-        state["data"]["secret1"] = incoming_msg.strip().lower()
-        state["step"] = "ask_secret2"
-        reply.body("🔐 Sécurité – Détail 2/2\nUn autre détail très spécifique et unique :")
-        return str(resp)
-
-    # Secret 2 → save & match (if lost)
-    if state["step"] == "ask_secret2":
-        state["data"]["secret2"] = incoming_msg.strip().lower()
-
-        # Save the report
-        save_report(state["data"], from_number, state["status"])
-
-        if state["status"] == "lost":
-            matches = find_secure_matches(
-                state["data"]["item"],
-                state["data"]["location"],
-                state["data"]["secret1"],
-                state["data"]["secret2"],
-                "found"
-            )
-
-            if matches:
-                match = matches[0]  # take first strong match
-                code = str(random.randint(100000, 999999))
-
-                # Mark as claimed (you may want to update this in main.py if needed)
-                send_whatsapp(
-                    match["phone"],
-                    f"Quelqu’un recherche un objet correspondant au vôtre ({match['item_name']}).\n"
-                    f"Si vous pensez que c’est le même, répondez :\n"
-                    f"APPROUVER {code}"
-                )
-
-                reply.body(
-                    "✅ Correspondance probable trouvée !\n"
-                    "Nous avons contacté le déposant pour confirmation.\n"
-                    "Vous serez averti(e) si c’est validé.\n"
-                    "Tapez 'status' plus tard pour suivre."
-                )
-            else:
-                reply.body(
-                    "Signalement enregistré.\n"
-                    "Pas de correspondance immédiate. Nous vous contacterons si un match apparaît."
-                )
-        else:
-            reply.body(
-                "✅ Merci ! Votre objet trouvé est maintenant signalé.\n"
-                "Si le propriétaire se manifeste avec les bons détails, nous vous mettrons en contact."
-            )
-
-        # End session
-        del user_sessions[from_number]
-        return str(resp)
-
-    # Fallback
-    reply.body("Désolé, je ne comprends pas cette étape.\nRecommencez en envoyant 1 ou 2.")
+    reply.body(ai_response)
     return str(resp)
 
 
 if __name__ == "__main__":
-    # For local development only
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
