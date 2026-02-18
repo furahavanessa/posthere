@@ -10,14 +10,17 @@ from database import get_session, save_session
 app = Flask(__name__)
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Strict Prompt to prevent the AI from making up stories
 SYSTEM_PROMPT = """
-You are 'PostHere Goma'. You ONLY record lost/found items.
-DO NOT tell stories. DO NOT say an owner was found unless the system tells you so.
-If the user asks 'Did someone lose/find this?', tell them: 'Let me check the official records...'
-When a report is done, output ONLY this JSON:
+You are 'PostHere Goma'. Collect: 1. Item name 2. Quartier 3. Description 4. Secret detail.
+If FOUND, ask for the 'drop_off_point' (Police station).
+Never apologize or say you are an AI. Never lie about matches.
+Output JSON only when complete:
 {"type":"lost/found", "item":"...", "location":"...", "description":"...", "drop_off_point":"...", "unique_detail_1":"..."}
 """
+
+@app.route("/", methods=['GET'])
+def home():
+    return "PostHere Goma is Live", 200
 
 @app.route("/whatsapp", methods=['POST'])
 def whatsapp():
@@ -25,17 +28,16 @@ def whatsapp():
     message = request.values.get('Body', '').strip()
     msg_low = message.lower()
 
-    # --- 1. THE TRUTH FILTER (Bypass AI for database queries) ---
-    # If the user asks "Did someone lose/find...", we go straight to the DB.
-    search_keywords = ["did someone", "found?", "lost?", "match", "anyone report", "est-ce que"]
-    if any(k in msg_low for k in search_keywords):
-        # This function in services.py looks at the REAL database
+    # --- 1. BYPASS AI FOR TRUTH CHECK ---
+    # If user asks "Did you find it?", we skip the AI and check the DB directly
+    status_keywords = ["find", "found", "lost", "check", "news", "recherche", "match"]
+    if any(k in msg_low for k in status_keywords) and len(msg_low.split()) < 6:
         result_text = check_db_for_matches(phone)
         resp = MessagingResponse()
         resp.message(result_text)
         return str(resp)
 
-    # --- 2. AI DATA ENTRY FLOW ---
+    # --- 2. AI DATA COLLECTION ---
     history = get_session(phone) or [{"role": "system", "content": SYSTEM_PROMPT}]
     history.append({"role": "user", "content": message})
 
@@ -43,31 +45,33 @@ def whatsapp():
         chat = groq_client.chat.completions.create(
             messages=history,
             model="llama-3.3-70b-versatile",
-            temperature=0.1 # Very low to prevent storytelling
+            temperature=0.2
         )
         ai_msg = chat.choices[0].message.content
-    except:
-        ai_msg = "Service temporarily busy. Try again."
+    except Exception as e:
+        print(f"Groq Error: {e}")
+        ai_msg = "Sorry, I'm having trouble thinking. Try again in a moment."
 
-    # --- 3. JSON EXTRACTION ---
+    # --- 3. JSON & MATCHING ---
     json_match = re.search(r'\{.*\}', ai_msg, re.DOTALL)
     if json_match:
         try:
             data = json.loads(json_match.group())
-            # Save and trigger proactive notification
+            # Save report and notify others
             rep_id, matches = handle_report_and_match(data, phone)
             ai_msg = re.sub(r'\{.*\}', '', ai_msg).strip()
             
             if matches:
-                ai_msg += "\n\n🚨 *SYSTEM MATCH:* We found a match! Check with the Mairie de Goma."
+                ai_msg += "\n\n🚨 *MATCH FOUND!* We found a report matching yours in our database."
             else:
-                ai_msg += "\n\n✅ Registered. We will text you the moment a match is found."
+                ai_msg += "\n\n✅ Report filed. We will text you the moment a match appears."
         except:
             pass
 
     history.append({"role": "assistant", "content": ai_msg})
     save_session(phone, history[-10:])
 
+    # --- 4. SECURE RETURN TO TWILIO ---
     resp = MessagingResponse()
     resp.message(ai_msg)
     return str(resp)
