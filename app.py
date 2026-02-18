@@ -29,9 +29,8 @@ groq_client   = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 # Per-user short-term memory: phone → list of messages
 conversation_history = {}
 
-# ───────────────────────────────────────────────
 # System prompt — controls when JSON is produced
-# ───────────────────────────────────────────────
+
 SYSTEM_PROMPT = """
 You are PostHere — the official, trustworthy Lost & Found assistant for Goma (DRC).
 
@@ -135,9 +134,9 @@ except Exception as e:
 print("[JSON/save error]", str(e))
 raw_reply += "\n\n(We had trouble processing the report — please try again.)"
 return raw_reply
-───────────────────────────────────────────────
-WhatsApp webhook endpoint
-───────────────────────────────────────────────
+
+#WhatsApp webhook endpoint
+
 @app.route("/whatsapp", methods=["POST"])
 @app.route("/whatsapp/", methods=["POST"])
 def whatsapp_webhook():
