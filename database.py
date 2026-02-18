@@ -1,29 +1,41 @@
-import sqlite3
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-def init_db():
-    # Connect to (or create) the database file
-    conn = sqlite3.connect('goma_lost_found.db')
-    cursor = conn.cursor()
-    
-    # We use a single table 'items' to store everything
-    # INTEGER PRIMARY KEY AUTOINCREMENT ensures every item has a unique ID number
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT NOT NULL,      -- e.g., 'Phone', 'Wallet'
-            location TEXT NOT NULL,       -- e.g., 'Majengo', 'Himbi'
-            status TEXT NOT NULL,         -- 'lost' or 'found'
-            description TEXT,             -- General description (e.g., 'Black Tecno')
-            secret_details TEXT,          -- THE DETECTIVE PART: (e.g., 'Cracked screen on bottom left')
-            image_url TEXT,               -- Link to the WhatsApp photo
-            phone_number TEXT,            -- Who reported it?
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    print("✅ GomaBot Database initialized with Detective features!")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if __name__ == "__main__":
-    init_db()
+def get_db_connection():
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor,
+        sslmode='require'
+    )
+
+def execute_query(query, params=(), fetch=False):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            if fetch:
+                result = cur.fetchall()
+                return result
+            conn.commit()
+            return True
+    except Exception as e:
+        print(f"Database Error: {e}")
+        conn.rollback()
+        return None
+    finally:
+        conn.close()
+
+def get_session(phone):
+    query = "SELECT history FROM sessions WHERE phone_number = %s"
+    res = execute_query(query, (phone,), fetch=True)
+    return res[0]['history'] if res else None
+
+def save_session(phone, history):
+    query = """
+        INSERT INTO sessions (phone_number, history) VALUES (%s, %s)
+        ON CONFLICT (phone_number) DO UPDATE SET history = EXCLUDED.history
+    """
+    execute_query(query, (phone, json.dumps(history)))
