@@ -1,79 +1,68 @@
 import os
-import re
-import json
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from groq import Groq
-from services import handle_report_and_match, check_db_for_matches
-from database import get_session, save_session
+from services import handle_simple_report, check_matches_and_notify
+from database import execute_query
 
 app = Flask(__name__)
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-
-SYSTEM_PROMPT = """
-You are 'PostHere Goma'. Collect: 1. Item name 2. Quartier 3. Description 4. Secret detail.
-If FOUND, ask for the 'drop_off_point' (Police station).
-Never apologize or say you are an AI. Never lie about matches.
-Output JSON only when complete:
-{"type":"lost/found", "item":"...", "location":"...", "description":"...", "drop_off_point":"...", "unique_detail_1":"..."}
-"""
-
-@app.route("/", methods=['GET'])
-def home():
-    return "PostHere Goma is Live", 200
 
 @app.route("/whatsapp", methods=['POST'])
 def whatsapp():
     phone = request.values.get('From', '')
-    message = request.values.get('Body', '').strip()
-    msg_low = message.lower()
-
-    # --- 1. BYPASS AI FOR TRUTH CHECK ---
-    # If user asks "Did you find it?", we skip the AI and check the DB directly
-    status_keywords = ["find", "found", "lost", "check", "news", "recherche", "match"]
-    if any(k in msg_low for k in status_keywords) and len(msg_low.split()) < 6:
-        result_text = check_db_for_matches(phone)
-        resp = MessagingResponse()
-        resp.message(result_text)
+    message = request.values.get('Body', '').strip().lower()
+    
+    # 1. Check user's current "Step" in the process
+    # We use a simple table or session to track their progress
+    user_session = execute_query("SELECT step, data FROM sessions WHERE phone_number = %s", (phone,), fetch=True)
+    
+    resp = MessagingResponse()
+    
+    if not user_session or message in ["reset", "start", "hello", "hi"]:
+        execute_query("DELETE FROM sessions WHERE phone_number = %s", (phone,))
+        execute_query("INSERT INTO sessions (phone_number, step, data) VALUES (%s, %s, %s)", (phone, 1, '{}'))
+        reply = "Welcome to PostHere Goma. 📍\n\nDid you **LOST** an item or **FOUND** an item? (Reply with one word)"
+        resp.message(reply)
         return str(resp)
 
-    # --- 2. AI DATA COLLECTION ---
-    history = get_session(phone) or [{"role": "system", "content": SYSTEM_PROMPT}]
-    history.append({"role": "user", "content": message})
+    step = user_session[0]['step']
+    data = json.loads(user_session[0]['data']) if user_session[0]['data'] else {}
 
-    try:
-        chat = groq_client.chat.completions.create(
-            messages=history,
-            model="llama-3.3-70b-versatile",
-            temperature=0.2
-        )
-        ai_msg = chat.choices[0].message.content
-    except Exception as e:
-        print(f"Groq Error: {e}")
-        ai_msg = "Sorry, I'm having trouble thinking. Try again in a moment."
-
-    # --- 3. JSON & MATCHING ---
-    json_match = re.search(r'\{.*\}', ai_msg, re.DOTALL)
-    if json_match:
-        try:
-            data = json.loads(json_match.group())
-            # Save report and notify others
-            rep_id, matches = handle_report_and_match(data, phone)
-            ai_msg = re.sub(r'\{.*\}', '', ai_msg).strip()
+    # 2. THE FLOW LOGIC
+    if step == 1: # Capture Type
+        if "lost" in message or "found" in message:
+            data['type'] = "lost" if "lost" in message else "found"
+            next_msg = "What is the name of the item? (e.g., Samsung S10, Brown Wallet)"
+            execute_query("UPDATE sessions SET step = 2, data = %s WHERE phone_number = %s", (json.dumps(data), phone))
+        else:
+            next_msg = "Please reply with either 'LOST' or 'FOUND'."
             
-            if matches:
-                ai_msg += "\n\n🚨 *MATCH FOUND!* We found a report matching yours in our database."
-            else:
-                ai_msg += "\n\n✅ Report filed. We will text you the moment a match appears."
-        except:
-            pass
+    elif step == 2: # Capture Item Name
+        data['item'] = message
+        next_msg = "In which Quartier (Neighborhood) of Goma? (e.g., Birere, Mabanga, Virunga)"
+        execute_query("UPDATE sessions SET step = 3, data = %s WHERE phone_number = %s", (json.dumps(data), phone))
 
-    history.append({"role": "assistant", "content": ai_msg})
-    save_session(phone, history[-10:])
+    elif step == 3: # Capture Location
+        data['location'] = message
+        next_msg = "Provide a unique secret detail (e.g., specific lock screen photo, a crack on the left side)."
+        execute_query("UPDATE sessions SET step = 4, data = %s WHERE phone_number = %s", (json.dumps(data), phone))
 
-    # --- 4. SECURE RETURN TO TWILIO ---
-    resp = MessagingResponse()
-    resp.message(ai_msg)
+    elif step == 4: # Finalize and Search
+        data['secret'] = message
+        # Save to main items table
+        handle_simple_report(data, phone)
+        
+        # Search for matches
+        match_found = check_matches_and_notify(data, phone)
+        
+        if match_found:
+            next_msg = "✅ DONE! We found a potential match in our database! Please head to the Mairie de Goma police post for verification."
+        else:
+            next_msg = "✅ Report Filed. We are searching... We will WhatsApp you the moment a match is reported."
+            
+        # Reset session so they can start over later
+        execute_query("DELETE FROM sessions WHERE phone_number = %s", (phone,))
+
+    resp.message(next_msg)
     return str(resp)
 
 if __name__ == "__main__":
