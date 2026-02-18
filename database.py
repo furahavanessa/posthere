@@ -1,5 +1,6 @@
 import os
 import psycopg2
+import json
 from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL")
