@@ -19,7 +19,7 @@ def whatsapp():
 
     # AI Response
     chat_completion = groq_client.chat.completions.create(
-        messages=history, model="llama-3.1-70b-versatile"
+        messages=history, model="llama-3.3-70b-versatile"
     )
     ai_msg = chat_completion.choices[0].message.content
     
@@ -43,4 +43,8 @@ def whatsapp():
     return str(resp)
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    import os
+    # Render provides the PORT environment variable automatically
+    port = int(os.environ.get("PORT", 5000))
+    # host="0.0.0.0" is REQUIRED for Render to see the app
+    app.run(host="0.0.0.0", port=port)
